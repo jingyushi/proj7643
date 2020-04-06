@@ -1,0 +1,290 @@
+import os
+import cv2
+import lmdb
+from random import Random
+from matplotlib import pyplot as plt
+from psutil import virtual_memory
+import click
+import time
+from glob import glob
+import numpy as np
+import math
+
+def writeFileList(dirNameArr):
+    """
+    Returns the python list object of the files under a directory name for processing later
+    """
+    '''
+    if isinstance(dirNameArr, basestring): # someone only inputed a single string, so make it a list so that this code works
+
+        dirNameArr = [dirNameArr]
+    '''
+    dirNameArr = [dirNameArr]
+    files_list = [] # list of all files with full path
+    for dirName in dirNameArr: 
+    # loop through all files in the list of directory names inputted. This is useful for multiple datasets	
+        with click.progressbar(os.walk(dirName), label="Parsing files in "+dirName) as bar:
+            for dirname, dirnames, filenames in bar:
+                for filename in filenames:
+                    if filename.endswith('.jpg') or filename.endswith('.png') or filename.endswith('.jpeg') or filename.endswith('.bmp') or filename.endswith('.tiff'):	
+                        fileName = glob(os.path.join(dirname, filename)) 
+                        files_list += fileName
+ 
+    return files_list,len(files_list)
+
+import torch
+import pickle
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
+import torch.optim as optim
+from PIL import Image
+
+from Model import Model
+
+#dirName = 'D:\\workspace\\proj7643\\CampusLoopDataset\\live'
+dirName = 'D:\\workspace\\data\\train_256_places365standard'
+t0 = time.time()
+files_list,total_number = writeFileList(dirName)
+t1 = time.time()
+print ('\n\nLoading Paths: ', (t1-t0) , ' seconds')
+
+device  = torch.device("cuda:0")
+model = Model().to(device)
+#PATH = 'model\\model.pth'
+#model.load_state_dict(torch.load(PATH))
+#criterion = nn.MSELoss(reduction = 'sum')
+
+criterion = nn.MSELoss()
+#criterion = nn.L1Loss(reduction = 'sum')
+optimizer = optim.Adam(model.parameters(), lr=1e-5,weight_decay=0.995)
+
+class TrainingSet(Dataset):
+    def __init__(self,paths,total_number,h=120,w=160):
+        self.h = h
+        self.w = w
+        self.length = total_number
+        self.hog = cv2.HOGDescriptor((16, 32), (16,16), (16,16), (8,8), 2,1)
+        self.imgs = paths
+        self.r = Random(0)
+        
+    def __len__(self):
+        return self.length
+        
+    def loader(self,path):
+        img = cv2.imread(path,0)
+        img = cv2.resize(img, (self.w, self.h), interpolation = cv2.INTER_CUBIC)
+        #img = cv2.resize(img,(self.h,self.w))
+        #img_tensor = torch.from_numpy(img).to(device)
+        return img
+    
+    def randPerspectiveWarp(self,im):
+        w = self.w
+        h = self.h
+        r = self.r
+        minsx = [ 0, 3*w/4 ]
+        maxsx = [ w/4, w ]
+        minsy= [ 0, 3*h/4 ]
+        maxsy = [ h/4, h ]
+
+
+        pts_orig = np.zeros((4, 2), dtype=np.float32)
+        pts_warp = np.zeros((4, 2), dtype=np.float32) 
+        pts_orig[0, 0] = 0
+        pts_orig[0, 1] = 0
+    
+        pts_orig[1, 0] = 0
+        pts_orig[1, 1] = h
+
+        pts_orig[2, 0] = w
+        pts_orig[2, 1] = 0
+
+        pts_orig[3, 0] = w
+        pts_orig[3, 1] = h
+        pts_warp[0, 0] = r.uniform(minsx[0], maxsx[0])
+        pts_warp[0, 1] = r.uniform(minsy[0], maxsy[0])
+    
+        pts_warp[1, 0] = r.uniform(minsx[0], maxsx[0])
+        pts_warp[1, 1] = r.uniform(minsy[1], maxsy[1])
+
+        pts_warp[2, 0] = r.uniform(minsx[1], maxsx[1])
+        pts_warp[2, 1] = r.uniform(minsy[0], maxsy[0])
+
+        pts_warp[3, 0] = r.uniform(minsx[1], maxsx[1])
+        pts_warp[3, 1] = r.uniform(minsy[1], maxsy[1])
+
+    # compute the 3x3 transform matrix based on the two planes of interest
+        T = cv2.getPerspectiveTransform(pts_warp, pts_orig)
+
+    # apply the perspective transormation to the image, causing an automated change in viewpoint for the net's dual input
+        im_warp = cv2.warpPerspective(im, T, (w, h))
+        return im_warp
+    
+    def __getitem__(self,index):
+        path = self.imgs[index]
+        #print(path)
+        ori_img = self.loader(path)
+        img_warp = self.randPerspectiveWarp(ori_img)
+        #ori_img = cv2.cvtColor(ori_img,cv2.IMREAD_GRAYSCALE)
+        #img_warp = cv2.cvtColor(img_warp,cv2.IMREAD_GRAYSCALE)
+        #plt.imshow(ori_img)
+        #plt.axis('off')
+        #plt.show()
+        #plt.imshow(img_warp)
+        #plt.axis('off')
+        #plt.show()
+        self.r.seed(index) # adds extra randomness, but is still reproduceable with the same dataset
+        switchFlag = self.r.randint(0,1)
+        if switchFlag:
+            img = img_warp
+            des = self.hog.compute(cv2.resize(ori_img, (160,120)))
+            #print(des)
+        else:
+            img = ori_img
+            des = self.hog.compute(cv2.resize(img_warp, (160,120)))
+        #img = torch.from_numpy(img).to(device)
+        #des = torch.from_numpy(des).to(device)
+        #print(img.dtype)
+        #print(des.dtype)
+        img = img.reshape(1,self.h,self.w)
+        des = des.reshape(3648,)
+        #print('mean:',np.mean(des))
+        #print('var:',np.var(des))
+        return img,des
+
+batch_size = 512
+PATH = 'model\\model.pth'
+trainingset = TrainingSet(files_list,total_number)
+trainloader = DataLoader(trainingset,batch_size,shuffle=True)
+max_epochs = 100
+iters = math.ceil(total_number/batch_size)
+for epoch in range(max_epochs):
+    avgloss = 0.0 # This loss is the average loss of an epoch
+    t0 = time.time()
+    for i,data in enumerate(trainloader):
+        imgs,desps = data
+        #print(imgs.shape)
+        #print(desps.shape)
+        #temp = imgs[0,:,:,:].reshape(120,160,1)
+        #print(temp)
+        #img = cv2.cvtColor(np.uint8(temp),cv2.IMREAD_GRAYSCALE)
+        #plt.imshow(img)
+        #plt.axis('off')
+        #plt.show()
+        #imgs,desps = data
+        #print(imgs.dtype)
+        imgs,desps = imgs.to(device=device,dtype=torch.float), desps.to(device=device,dtype=torch.float)
+        #cv2.imshow(imgs)
+        #print(torch.mean(desps))
+        optimizer.zero_grad()
+        outputs = model(imgs)
+        #print(outputs[22,:])
+        #print(desps[0,:])
+        loss = criterion(outputs,desps)
+        loss.backward()
+        optimizer.step()
+        #print('loss:%.3f'%loss.item())
+        avgloss += loss.item()
+        print('[Epoch %d,iteration %d] loss: %5f'%(epoch + 1,i+1,loss.item()))
+        if i%iters==iters-1:#According to the size of the dataset and batchsize
+            print('[Epoch %d] loss: %.3f time used: %.3f' %
+                      (epoch + 1, avgloss / 70,time.time()-t0))
+            avgloss = 0.0
+    if epoch%100 == 99:
+        CP_PATH = 'model\\model_'+str(epoch)+'.pth'
+        torch.save(model.state_dict(),CP_PATH)
+    elif epoch%20 == 19:
+        torch.save(model.state_dict(), PATH)
+        print('small step checkpoint saved')
+        
+import torchvision.models as models
+import torch.nn as nn
+import torch.nn.functional as F
+device  = torch.device("cuda:0")
+alexnet = models.alexnet(pretrained=True,progress=True).to(device)
+#print(alexnet)
+#print(alexnet.features[0].parameters())
+
+#print(alexnet)
+#alexnet = alexnet.to(device)
+alexnet.features[0] = nn.Conv2d(in_channels=1,out_channels=64,kernel_size=11,stride=4,padding=2)
+alexnet.classifier[6] = nn.Linear(4096,3648)
+lr = 1e-5
+#optimizer = optim.Adam(alexnet.parameters(), lr=lr,weight_decay=0.995)
+
+#in_layer_params = list(alexnet.features[0].parameters())
+#out_layer1_params = list(alexnet.classifier[6].parameters())
+#out_layer2_params = list(alexnet.classifier[4].parameters())
+#out_layer3_params = list(alexnet.classifier[1].parameters())
+#print(alexnet.features[0])
+#base_params = filter(lambda p: id(p) not in in_layer_params+out_layer1_params+out_layer2_params+out_layer3_params,alexnet.parameters())
+#base_params2 = list(map(id, alexnet.avgpool[0].parameters()))
+#base_params3 = filter(lambda p: id(p) not in out_layer1_params+out_layer2_params+out_layer3_params,alexnet.classifier.parameters())
+
+#for i in optimizer.param_groups:
+#    print(i)
+#    for k,v in i.items():
+#        print(k)
+#print(in_layer_params,out_layer1_params,out_layer2_params,out_layer3_params)
+#print(base_params2)
+optimizer = optim.Adam([{'params': alexnet.features[0].parameters()},
+                        {'params': alexnet.classifier[6].parameters(),'lr': lr*1e5},
+                        {'params': alexnet.classifier[4].parameters(),'lr': lr*1e5},
+                        {'params': alexnet.classifier[1].parameters(),'lr': lr*1e5}],
+                       lr=lr,weight_decay=0.995)
+alexnet.cuda()
+
+PATH = 'model\\alexnet.pth'
+#model.load_state_dict(torch.load(PATH))
+criterion = nn.MSELoss(reduction = 'sum')
+#criterion = nn.L1Loss(reduction = 'sum')
+
+batch_size = 512
+trainingset = TrainingSet(files_list,total_number)
+trainloader = DataLoader(trainingset,batch_size,shuffle=True)
+max_epochs = 100
+iters = math.ceil(total_number/batch_size)
+for epoch in range(max_epochs):
+    avgloss = 0.0 # This loss is the average loss of an epoch
+    t0 = time.time()
+    for i,data in enumerate(trainloader):
+        imgs,desps = data
+        #print(imgs.shape)
+        #print(desps.shape)
+        #temp = imgs[0,:,:,:].reshape(120,160,1)
+        #print(temp)
+        #img = cv2.cvtColor(np.uint8(temp),cv2.IMREAD_GRAYSCALE)
+        #plt.imshow(img)
+        #plt.axis('off')
+        #plt.show()
+        #imgs,desps = data
+        #print(imgs.dtype)
+        imgs,desps = imgs.to(device=device,dtype=torch.float), desps.to(device=device,dtype=torch.float)
+        #cv2.imshow(imgs)
+        #print(torch.mean(desps))
+        optimizer.zero_grad()
+        outputs = alexnet(imgs)
+        #print(outputs[22,:])
+        #print(desps[0,:])
+        loss = criterion(outputs,desps)
+        loss.backward()
+        optimizer.step()
+        #print('loss:%.3f'%loss.item())
+        avgloss += loss.item()
+        print('[Epoch %d,iteration %d] loss: %5f'%(epoch + 1,i+1,loss.item()))
+        if i%iters==iters-1:#According to the size of the dataset and batchsize
+            print('[Epoch %d] loss: %.3f time used: %.3f' %
+                      (epoch + 1, avgloss / 70,time.time()-t0))
+            avgloss = 0.0
+    if epoch%100 == 99:
+        CP_PATH = 'model\\model_'+str(epoch)+'.pth'
+        torch.save(model.state_dict(),CP_PATH)
+    elif epoch%20 == 19:
+        torch.save(model.state_dict(), PATH)
+        print('small step checkpoint saved')
+        
+#datapath = 'D:\\workspace\\data\\dataset\\06\\test'
+#datapath = 'D:\\workspace\\data\\spring_summer'
+datapath = 'D:\workspace\proj7643\CampusLoopDataset'
+plot(alexnet,datapath)
